@@ -9,29 +9,36 @@
 
 ---
 
-## 🌐 Language implementations
+## 🌐 Language Implementations
 
-| Language             | Repository                                             |
-|----------------------|--------------------------------------------------------|
-| TypeScript / Node.js | [redis-smq](https://github.com/weyoss/redis-smq)       |
-| Go                   | [go-redis-smq](https://github.com/weyoss/go-redis-smq) |
+| Language             | Repository                                             | Status                   |
+|----------------------|--------------------------------------------------------|--------------------------|
+| TypeScript / Node.js | [redis-smq](https://github.com/weyoss/redis-smq)       | Reference implementation |
+| Go                   | [go-redis-smq](https://github.com/weyoss/go-redis-smq) | Fully compatible         |
 
 > All implementations share the same wire protocol and data schema.
 
-## ✨ Features
+---
 
-- 📬 Reliable delivery with retries and dead‑letter queues
-- 🚀 High-throughput design with atomic Lua scripts
-- 📊 Multiple queue types: FIFO, LIFO, Priority
-- 🔀 Flexible routing: Direct, Topic, Fanout exchanges + direct queue publishing
-- 👥 Pub/Sub and Point‑to‑Point delivery models, consumer groups
-- ⏰ Scheduling: delays, CRON, repeating messages
-- 🚦 Queue‑level rate limiting
-- ⏱️ Message TTL and consumption timeouts
-- 📦 Batch acknowledgements (99% fewer Redis calls)
-- 🔒 Queue state management (pause/stop/resume) with audit
-- 📡 Internal event bus  for real-time internal events
-- 🌐 REST API and Web UI (provided by the TypeScript implementation, compatible with all clients)
+## ✨ Key Features
+
+| Feature                       | Description                                                                            |
+|-------------------------------|----------------------------------------------------------------------------------------|
+| 📬 **Reliable delivery**      | At‑least‑once delivery with retries, dead‑letter queues, and automatic crash recovery. |
+| 🚀 **High throughput**        | Atomic Lua scripts and efficient Redis data structures.                                |
+| 📊 **Multiple queue types**   | FIFO, LIFO, and Priority.                                                              |
+| 🔀 **Flexible routing**       | Direct, Topic, Fanout exchanges plus direct queue publishing.                          |
+| 👥 **Delivery models**        | Point‑to‑Point and Pub/Sub with consumer groups.                                       |
+| ⏰ **Scheduling**              | Delayed delivery, CRON schedules, and repeating messages.                              |
+| 🚦 **Rate limiting**          | Per‑queue throughput control.                                                          |
+| ⏱️ **TTL & timeouts**         | Message expiry and consumption timeouts.                                               |
+| 📦 **Batch acknowledgements** | Reduced Redis calls for high‑throughput consumers.                                     |
+| 🔒 **Queue state management** | Pause, stop, resume, and lock queues with audit.                                       |
+| 📡 **Event bus**              | Real‑time system events via Redis Pub/Sub.                                             |
+| 🌐 **Cross‑language**         | Go and TypeScript implementations share one protocol.                                  |
+| 🔧 **REST API & Web UI**      | Provided by the TypeScript implementation; compatible with all clients.                |
+
+---
 
 ## 🎯 Use Cases
 
@@ -40,9 +47,13 @@
 - Microservices communication
 - Real‑time event handling (gaming, IoT, analytics)
 
+---
+
 ## 📋 Requirements
 
-- **Redis** ≥ 4
+- **Redis** ≥ 4.0
+
+---
 
 ## 📂 Documentation Structure
 
@@ -50,7 +61,7 @@ The documentation is **versioned** to stay in sync with the evolving specificati
 A **specification version** (e.g., `v1.0`) groups a compatible set of language‑specific releases.
 
 > ℹ️ The specification version is independent of any library’s semantic version.  
-> Each folder is an immutable snapshot of the concepts at that point in time.
+> Each versioned folder is an immutable snapshot of the concepts at that point in time.
 
 ### Folder Layout
 
@@ -61,26 +72,27 @@ A **specification version** (e.g., `v1.0`) groups a compatible set of language�
 
 ### Compatibility Matrix
 
-| Docs Folder                | `redis-smq` (TypeScript) | `go-redis-smq` (Go) | Status               |
-|----------------------------|--------------------------|---------------------|----------------------|
-| [`/next/`](next/README.md) | `next` branch / `@next`  | `next` branch       | 🚧 Unreleased        |
-| **`/v1.0/`** (TBD)         | `≥11.0.0 <11.1.0`        | `≥1.0.0 <1.1.0`     | ✅ **Latest Stable**  |
+| Docs Folder                | `redis-smq` (TypeScript) | `go-redis-smq` (Go) | Status                |
+|----------------------------|--------------------------|---------------------|-----------------------|
+| [`/next/`](next/README.md) | `next` branch / `@next`  | `next` branch       | 🚧 Unreleased         |
+| **`/v1.0/`** (TBD)         | `≥11.0.0 <11.1.0`        | `≥1.0.0 <1.1.0`     | ✅ **Latest Stable**   |
 
 > ⚠️ Always check this table before reading the docs to ensure you’re viewing the version that matches your runtime.
 
-## 📖 How to Read
+---
 
-1. Start with the **Features** and **Use Cases** above.  
-2. Pick the specification folder that matches your library version (see matrix).  
-3. Inside that folder you’ll find language‑agnostic descriptions of:
-   - Queues, delivery models, exchanges
-   - Message lifecycle, scheduling, retries
-   - Rate limiting, namespaces, and more
-4. For API details, refer to the language‑specific library documentation.
+## 🚀 Getting Started
+
+- If you are using a development branch, begin with the [`/next/` specification](next/README.md) and its [Getting Started](next/getting-started.md) guide.
+- For stable releases, wait for the versioned folder (e.g., `/v1.0/`) to be published.
+
+For the full document index of the current development specification, see [`next/README.md`](next/README.md).
+
+---
 
 ## 🤝 Contributing
 
-Documentation improvements are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
+Documentation improvements are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
 ## 📄 License
 
