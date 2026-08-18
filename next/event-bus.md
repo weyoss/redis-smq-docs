@@ -1,263 +1,645 @@
 # Event Bus
 
-The event bus is the internal publish/subscribe mechanism of RedisSMQ. It uses Redis Pub/Sub to deliver real‑time notifications about system activity. Other components inside the same instance, other connected instances, and external monitors can all subscribe to these events.
+RedisSMQ uses Redis Pub/Sub to deliver real‑time notifications about system activity. There are **two independent event buses**:
+
+- **Internal Event Bus (system)** – always active, used for cross‑instance synchronisation and internal component communication.
+- **Public Event Bus (user)** – optional, intended for external monitoring and integration.
+
+An **event multiplexer** routes each event to one or both buses based on a static routing policy.
 
 ## How It Works
 
-Events are published to Redis channels. Each channel corresponds to a specific event type, for example:
+Each bus uses a separate Redis Pub/Sub namespace:
 
 ```
-queue.queueCreated
-consumer.messageAcknowledged
-events:producer.up
+redis-smq:events:system:*   → Internal bus
+redis-smq:events:user:*     → Public bus
 ```
 
-All channels are namespaced under `redis-smq:events:`. Subscribers listen on one or more channels and receive event payloads as JSON messages.
+The channel name is derived from the event name and the bus namespace. For example:
+
+- Internal: `redis-smq:events:system:queue.stateChanged`
+- Public: `redis-smq:events:user:queue.queueCreated`
+
+```mermaid
+flowchart LR
+    subgraph Publishers
+        P1[Producer]
+        P2[Consumer]
+        P3[Manager]
+    end
+
+    subgraph Multiplexer["Event Multiplexer"]
+        ROUTE["Routing Policy"]
+    end
+
+    subgraph Internal["Internal Bus (system)"]
+        CHI["Redis Pub/Sub\nnamespace: system"]
+    end
+
+    subgraph Public["Public Bus (user)"]
+        CHP["Redis Pub/Sub\nnamespace: user"]
+    end
+
+    subgraph Subscribers
+        S1[Internal Component]
+        S2[Another Instance]
+        S3[External Monitor]
+    end
+
+    P1 -->|event| ROUTE
+    P2 -->|event| ROUTE
+    P3 -->|event| ROUTE
+
+    ROUTE -->|SYSTEM| CHI
+    ROUTE -->|USER| CHP
+    ROUTE -->|BOTH| CHI
+    ROUTE -->|BOTH| CHP
+
+    CHI -->|SUBSCRIBE| S1
+    CHI -->|SUBSCRIBE| S2
+    CHP -->|SUBSCRIBE| S3
+```
+
+The multiplexer ensures internal events never reach external subscribers unless explicitly routed to the public bus, and public events can be disabled without affecting system synchronisation.
 
 ## Characteristics
 
-- **Fire‑and‑forget** – Events are not persisted. If no subscriber is listening at the moment an event is published, that event is lost.
-- **No delivery guarantees** – There is no acknowledgment mechanism for events. A subscriber that disconnects and reconnects will miss all events that occurred while it was away.
-- **Real‑time only** – Subscribers only receive events published **after** they subscribe. There is no history or replay.
-- **Optional** – The event bus can be disabled. When disabled, events are not published at all, reducing Redis load but also preventing cross‑instance state synchronisation.
-- **Internal synchronisation** – Within the system, the event bus is the primary mechanism for keeping multiple instances in sync. For example:
-  - Producers update their local cache of Pub/Sub consumer groups when a consumer group is created or deleted.
-  - Consumers react to queue state changes (e.g., stop processing when a queue is paused) without polling Redis.
+| Property              | Internal Bus (system)                                      | Public Bus (user)                           |
+|-----------------------|------------------------------------------------------------|---------------------------------------------|
+| **Purpose**           | Cross‑instance synchronisation, internal component updates | External monitoring and integration         |
+| **Activation**        | Always active (required for correct operation)             | Optional – can be enabled/started on demand |
+| **Persistence**       | None – events are not stored                               | None                                        |
+| **Delivery**          | Fire‑and‑forget, no acknowledgment                         | Fire‑and‑forget                             |
+| **History / Replay**  | No                                                         | No                                          |
+| **Channel prefix**    | `redis-smq:events:system:`                                 | `redis-smq:events:user:`                    |
+| **Wire format**       | JSON array of positional arguments                         | JSON array of positional arguments          |
+| **Event routing**     | Depends on routing policy                                  | Depends on routing policy                   |
+
+## Event Routing Policy
+
+The routing policy defines where each event is published. The default targets are:
+
+| Event                         | Target   | Notes                                                       |
+|-------------------------------|----------|-------------------------------------------------------------|
+| `queue.queueCreated`          | `BOTH`   | Internal cache update + public notification                 |
+| `queue.queueDeleted`          | `BOTH`   | Internal cache update + public notification                 |
+| `queue.consumerGroupCreated`  | `BOTH`   | Internal cache update + public notification                 |
+| `queue.consumerGroupDeleted`  | `BOTH`   | Internal cache update + public notification                 |
+| `queue.stateChanged`          | `BOTH`   | Internal consumer reaction + public monitoring              |
+| `configuration.updated`       | `SYSTEM` | Only internal – not exposed publicly                        |
+| All producer events           | `USER`   | Public only – for external monitoring                       |
+| All consumer events           | `USER`   | Public only – for external monitoring                       |
+
+> ⚠️ Producer and consumer events are **not** used for internal synchronisation. They are purely informational and intended for observability.
+
+## Event Payload Format
+
+Events are serialised as a JSON array. Each event has a fixed number of positional arguments whose order and types are documented below.
 
 ## Event Reference
 
-Events are grouped by the domain that emits them.
-
 ### Configuration Events
 
-#### `configuration.updated`
+#### `configuration.updated` – Internal only
 
-Fires when the system configuration is saved or updated.
+Fires when system configuration is saved or updated.
 
-| Field     | Type     | Description                                                       |
-|-----------|----------|-------------------------------------------------------------------|
-| `config`  | object   | Full configuration object (see [Configuration](configuration.md)) |
-| `version` | number   | Configuration version                                             |
+| Argument | Type   | Description                 |
+|----------|--------|-----------------------------|
+| `config` | object | Full configuration object   |
+| `version`| number | Configuration version       |
 
-### Queue Events
+### Queue Events (routed to BOTH)
 
 #### `queue.queueCreated`
 
-Fires when a new queue is created.
-
-| Field        | Type   | Description                                                   |
-|--------------|--------|---------------------------------------------------------------|
-| `queue`      | object | `{ ns: string, name: string }`                                |
-| `properties` | object | Queue properties (type, delivery model, message counts, etc.) |
+| Argument      | Type   | Description                                                    |
+|---------------|--------|----------------------------------------------------------------|
+| `queue`       | object | `{ ns: string, name: string }`                                |
+| `properties`  | object | Queue properties (type, delivery model, message counts, etc.) |
 
 #### `queue.queueDeleted`
 
-Fires when a queue is deleted.
-
-| Field   | Type   | Description                    |
-|---------|--------|--------------------------------|
-| `queue` | object | `{ ns: string, name: string }` |
+| Argument | Type   | Description                     |
+|----------|--------|---------------------------------|
+| `queue`   | object | `{ ns: string, name: string }` |
 
 #### `queue.stateChanged`
 
-Fires when the operational state of a queue changes.
-
-| Field        | Type   | Description                                                                                                |
-|--------------|--------|------------------------------------------------------------------------------------------------------------|
-| `queue`      | object | `{ ns: string, name: string }`                                                                             |
-| `transition` | object | State transition object (`from`, `to`, `reason`, `timestamp`, optional `description`/`lockId`/`lockOwner`) |
+| Argument      | Type   | Description                                                                                         |
+|---------------|--------|-----------------------------------------------------------------------------------------------------|
+| `queue`       | object | `{ ns: string, name: string }`                                                                     |
+| `transition`  | object | State transition object (`from`, `to`, `reason`, `timestamp`, optional `description`/`lockId`/`lockOwner`) |
 
 #### `queue.consumerGroupCreated`
 
-Fires when a consumer group is created for a Pub/Sub queue.
-
-| Field     | Type   | Description                    |
-|-----------|--------|--------------------------------|
-| `queue`   | object | `{ ns: string, name: string }` |
-| `groupId` | string | Consumer group identifier      |
+| Argument     | Type   | Description                     |
+|--------------|--------|---------------------------------|
+| `queue`      | object | `{ ns: string, name: string }` |
+| `groupId`    | string | Consumer group identifier       |
 
 #### `queue.consumerGroupDeleted`
 
-Fires when a consumer group is deleted from a Pub/Sub queue.
+| Argument     | Type   | Description                     |
+|--------------|--------|---------------------------------|
+| `queue`      | object | `{ ns: string, name: string }` |
+| `groupId`    | string | Consumer group identifier       |
 
-| Field     | Type   | Description                    |
-|-----------|--------|--------------------------------|
-| `queue`   | object | `{ ns: string, name: string }` |
-| `groupId` | string | Consumer group identifier      |
-
-### Producer Events
+### Producer Events (USER only)
 
 #### `producer.up`
 
-Fires when a producer has fully started and is ready to publish messages.
-
-| Field        | Type   | Description |
-|--------------|--------|-------------|
-| `producerId` | string | Producer ID |
+| Argument      | Type   | Description |
+|---------------|--------|-------------|
+| `producerId`  | string | Producer ID |
 
 #### `producer.goingUp`
 
-Fires just before a producer starts its initialisation.
-
-| Field        | Type   | Description |
-|--------------|--------|-------------|
-| `producerId` | string | Producer ID |
+| Argument      | Type   | Description |
+|---------------|--------|-------------|
+| `producerId`  | string | Producer ID |
 
 #### `producer.down`
 
-Fires after a producer has completely shut down.
-
-| Field        | Type   | Description |
-|--------------|--------|-------------|
-| `producerId` | string | Producer ID |
+| Argument      | Type   | Description |
+|---------------|--------|-------------|
+| `producerId`  | string | Producer ID |
 
 #### `producer.goingDown`
 
-Fires just before a producer begins its shutdown sequence.
-
-| Field        | Type   | Description |
-|--------------|--------|-------------|
-| `producerId` | string | Producer ID |
+| Argument      | Type   | Description |
+|---------------|--------|-------------|
+| `producerId`  | string | Producer ID |
 
 #### `producer.messagePublished`
 
-Fires when a message is successfully published to a queue or via an exchange.
+| Argument      | Type   | Description                                                |
+|---------------|--------|------------------------------------------------------------|
+| `messageId`   | string | Published message ID                                       |
+| `queue`       | object | `{ ns: string, name: string }` (destination queue)        |
+| `producerId`  | string | Producer ID                                                |
 
-| Field        | Type   | Description                                                   |
-|--------------|--------|---------------------------------------------------------------|
-| `messageId`  | string | Published message ID                                          |
-| `queue`      | object | `{ ns: string, name: string }` (destination queue)            |
-| `producerId` | string | Producer ID                                                   |
-| `groupId`    | string | Consumer group ID (only for Pub/Sub queues, empty otherwise)  |
-
-### Consumer Events
+### Consumer Events (USER only)
 
 #### `consumer.up`
 
-Fires when a consumer has fully started.
-
-| Field        | Type   | Description |
-|--------------|--------|-------------|
-| `consumerId` | string | Consumer ID |
+| Argument      | Type   | Description |
+|---------------|--------|-------------|
+| `consumerId`  | string | Consumer ID |
 
 #### `consumer.goingUp`
 
-Fires just before a consumer starts its initialisation.
-
-| Field        | Type   | Description |
-|--------------|--------|-------------|
-| `consumerId` | string | Consumer ID |
+| Argument      | Type   | Description |
+|---------------|--------|-------------|
+| `consumerId`  | string | Consumer ID |
 
 #### `consumer.down`
 
-Fires after a consumer has completely shut down.
-
-| Field        | Type   | Description |
-|--------------|--------|-------------|
-| `consumerId` | string | Consumer ID |
+| Argument      | Type   | Description |
+|---------------|--------|-------------|
+| `consumerId`  | string | Consumer ID |
 
 #### `consumer.goingDown`
 
-Fires just before a consumer begins its shutdown sequence.
-
-| Field        | Type   | Description |
-|--------------|--------|-------------|
-| `consumerId` | string | Consumer ID |
+| Argument      | Type   | Description |
+|---------------|--------|-------------|
+| `consumerId`  | string | Consumer ID |
 
 #### `consumer.messageReceived`
 
-Fires when a message has been dequeued and is about to be passed to the handler.
-
-| Field        | Type   | Description                    |
-|--------------|--------|--------------------------------|
-| `messageId`  | string | Message ID                     |
-| `queue`      | object | `{ ns: string, name: string }` |
-| `consumerId` | string | Consumer ID                    |
+| Argument      | Type   | Description                     |
+|---------------|--------|---------------------------------|
+| `messageId`   | string | Message ID                      |
+| `queue`       | object | `{ ns: string, name: string }` |
+| `consumerId`  | string | Consumer ID                     |
 
 #### `consumer.messageAcknowledged`
 
-Fires when a message was successfully processed by the handler.
-
-| Field              | Type   | Description                              |
-|--------------------|--------|------------------------------------------|
-| `messageId`        | string | Message ID                               |
-| `queue`            | object | `{ ns: string, name: string }`           |
-| `messageHandlerId` | string | Message handler ID (same as consumer ID) |
-| `consumerId`       | string | Consumer ID                              |
+| Argument      | Type   | Description                     |
+|---------------|--------|---------------------------------|
+| `messageId`   | string | Message ID                      |
+| `queue`       | object | `{ ns: string, name: string }` |
+| `consumerId`  | string | Consumer ID                     |
 
 #### `consumer.messageUnacknowledged`
 
-Fires when message processing failed. The handler returned an error, or the message expired.
-
-| Field              | Type   | Description                                                 |
-|--------------------|--------|-------------------------------------------------------------|
-| `messageId`        | string | Message ID                                                  |
-| `queue`            | object | `{ ns: string, name: string }`                              |
-| `messageHandlerId` | string | Message handler ID                                          |
-| `consumerId`       | string | Consumer ID                                                 |
-| `cause`            | number | Unacknowledgment cause (see implementation for enum values) |
+| Argument      | Type   | Description                     |
+|---------------|--------|---------------------------------|
+| `messageId`   | string | Message ID                      |
+| `queue`       | object | `{ ns: string, name: string }` |
+| `consumerId`  | string | Consumer ID                     |
+| `cause`       | number | Unacknowledgment cause enum     |
 
 #### `consumer.messageDeadLettered`
 
-Fires when a message was moved to the dead‑letter queue after exhausting retries or expiring.
-
-| Field              | Type   | Description                                            |
-|--------------------|--------|--------------------------------------------------------|
-| `messageId`        | string | Message ID                                             |
-| `queue`            | object | `{ ns: string, name: string }`                         |
-| `messageHandlerId` | string | Message handler ID                                     |
-| `consumerId`       | string | Consumer ID                                            |
-| `cause`            | number | Dead‑letter cause (see implementation for enum values) |
+| Argument      | Type   | Description                     |
+|---------------|--------|---------------------------------|
+| `messageId`   | string | Message ID                      |
+| `queue`       | object | `{ ns: string, name: string }` |
+| `consumerId`  | string | Consumer ID                     |
+| `cause`       | number | Dead‑letter cause enum          |
 
 #### `consumer.messageRequeued`
 
-Fires when a message was requeued for immediate retry.
-
-| Field              | Type   | Description                    |
-|--------------------|--------|--------------------------------|
-| `messageId`        | string | Message ID                     |
-| `queue`            | object | `{ ns: string, name: string }` |
-| `messageHandlerId` | string | Message handler ID             |
-| `consumerId`       | string | Consumer ID                    |
+| Argument      | Type   | Description                     |
+|---------------|--------|---------------------------------|
+| `messageId`   | string | Message ID                      |
+| `queue`       | object | `{ ns: string, name: string }` |
+| `consumerId`  | string | Consumer ID                     |
 
 #### `consumer.messageDelayed`
 
-Fires when a message was delayed and will be retried later.
+| Argument      | Type   | Description                     |
+|---------------|--------|---------------------------------|
+| `messageId`   | string | Message ID                      |
+| `queue`       | object | `{ ns: string, name: string }` |
+| `consumerId`  | string | Consumer ID                     |
 
-| Field              | Type   | Description                    |
-|--------------------|--------|--------------------------------|
-| `messageId`        | string | Message ID                     |
-| `queue`            | object | `{ ns: string, name: string }` |
-| `messageHandlerId` | string | Message handler ID             |
-| `consumerId`       | string | Consumer ID                    |
+## Cause Enums
+
+### Unacknowledgment Cause
+
+Used by `consumer.messageUnacknowledged`.
+
+| Value | Name | Description |
+|------:|------|-------------|
+| 0 | `TIMEOUT` | Message consume timeout exceeded. |
+| 1 | `CONSUME_ERROR` | Handler returned an error. |
+| 2 | `UNACKNOWLEDGED` | Message explicitly unacknowledged. |
+| 3 | `OFFLINE_CONSUMER` | Consumer offline; in‑flight messages recovered. |
+| 4 | `SHUTTING_DOWN` | Consumer shut down while processing. |
+| 5 | `TTL_EXPIRED` | Message TTL expired. |
+| 6 | `QUEUE_STOPPED` | Queue stopped while message in flight. |
+| 7 | `QUEUE_INVALID_STATE` | Queue was in invalid state. |
+| 8 | `QUEUE_LOCKED` | Queue locked and operation rejected. |
+| 9 | `MESSAGE_NOT_FOUND` | Message no longer exists. |
+| 10 | `QUEUE_STATE_CHANGED` | Queue state changed during processing. |
+| 11 | `QUEUE_NOT_FOUND` | Queue no longer exists. |
+| 12 | `UNEXPECTED_ERROR` | Unexpected internal error. |
+| 13 | `INVALID_HANDLER_SIGNATURE` | Invalid handler signature. |
+
+### Dead‑Letter Cause
+
+Used by `consumer.messageDeadLettered`.
+
+| Value | Name | Description |
+|------:|------|-------------|
+| 0 | `TTL_EXPIRED` | Message TTL expired. |
+| 1 | `RETRY_THRESHOLD_EXCEEDED` | Message exceeded retry threshold. |
+| 2 | `PERIODIC_MESSAGE` | Periodic message (CRON/repeat) was not retried. |
 
 ## Subscribing to Events
 
-Subscribe to one or more event channels by name. Handlers receive a JSON payload with the fields described above. Multiple handlers can subscribe to the same event, and they will all be invoked when the event is published.
+- Internal components subscribe to the **system bus** (`redis-smq:events:system:*`).
+- External monitors and integrations subscribe to the **public user bus** (`redis-smq:events:user:*`).
 
-The subscription API and exact handler signature depend on the language implementation, but they all follow the same pattern: register a callback for a given event name, and call `unsubscribe()` to stop receiving events.
+Language implementations provide typed subscription helpers for the public bus. For example:
 
-## Use Cases
+```go
+// Go example
+queueEvents.SubscribeCreated(func(p queueEvents.CreatedPayload) {
+    // handle created queue
+})
+```
 
-- **Monitoring** – Track message flow and system health in real time.
-- **Alerting** – Detect failures, dead‑lettered messages, or queue state changes.
-- **Metrics** – Count messages processed, failed, requeued, and delayed.
-- **Audit** – Log all system activity alongside the internal message audit.
-- **Integration** – Trigger external actions on specific events (e.g., send an HTTP webhook when a message is dead‑lettered).
+```typescript
+// TypeScript example
+eventBus.on('queue.queueCreated', (queue, properties) => {
+    // handle created queue
+});
+```
 
-## Performance
-
-The event bus uses Redis Pub/Sub, which is efficient but fire‑and‑forget. Publishing an event adds a single Redis `PUBLISH` command. Subscribers receive messages asynchronously.
-
-- Events are not persisted; they exist only in transit.
-- Publishing is fast and non‑blocking.
-- High‑frequency events (e.g., every message acknowledgment) can generate significant Pub/Sub traffic. Disable the event bus entirely if it is not needed.
-
-For critical, persistent audit trails, use the built‑in message audit feature instead of relying solely on events.
+The exact API varies by language, but the event names, channel prefixes, and payload formats are identical.
 
 ## Best Practices
 
-- Keep event handlers fast. They run synchronously in the subscriber’s event loop; long‑running handlers can delay other events.
-- Do not rely on events for guaranteed data delivery. They are best for reactive, non‑critical logic.
-- Unsubscribe when no longer needed to free resources and avoid memory leaks.
-- Treat the event bus as optional. If cross‑instance synchronisation or real‑time monitoring is not required, disable it to reduce Redis load.
+- Keep event handlers fast; they run synchronously in the subscriber’s event loop.
+- Do not rely on events for guaranteed data delivery; use message audit for persistent records.
+- Unsubscribe when subscriptions are no longer needed.
+- Treat the public bus as optional. If you don’t need external monitoring, you can avoid starting it entirely.
+- Never subscribe to the internal system bus from external code; use the public bus for observability.
+```
+
+This document is now fully updated for the dual-bus architecture, routing policies, payload format, and cause enums.```markdown
+# Event Bus
+
+RedisSMQ uses Redis Pub/Sub to deliver real‑time notifications about system activity. There are **two independent event buses**:
+
+- **Internal Event Bus (system)** – always active, used for cross‑instance synchronisation and internal component communication.
+- **Public Event Bus (user)** – optional, intended for external monitoring and integration.
+
+An **event multiplexer** routes each event to one or both buses based on a static routing policy.
+
+## How It Works
+
+Each bus uses a separate Redis Pub/Sub namespace:
+
+```
+redis-smq:events:system:*   → Internal bus
+redis-smq:events:user:*     → Public bus
+```
+
+The channel name is derived from the event name and the bus namespace. For example:
+
+- Internal: `redis-smq:events:system:queue.stateChanged`
+- Public: `redis-smq:events:user:queue.queueCreated`
+
+```mermaid
+flowchart LR
+    subgraph Publishers
+        P1[Producer]
+        P2[Consumer]
+        P3[Manager]
+    end
+
+    subgraph Multiplexer["Event Multiplexer"]
+        ROUTE["Routing Policy"]
+    end
+
+    subgraph Internal["Internal Bus (system)"]
+        CHI["Redis Pub/Sub\nnamespace: system"]
+    end
+
+    subgraph Public["Public Bus (user)"]
+        CHP["Redis Pub/Sub\nnamespace: user"]
+    end
+
+    subgraph Subscribers
+        S1[Internal Component]
+        S2[Another Instance]
+        S3[External Monitor]
+    end
+
+    P1 -->|event| ROUTE
+    P2 -->|event| ROUTE
+    P3 -->|event| ROUTE
+
+    ROUTE -->|SYSTEM| CHI
+    ROUTE -->|USER| CHP
+    ROUTE -->|BOTH| CHI
+    ROUTE -->|BOTH| CHP
+
+    CHI -->|SUBSCRIBE| S1
+    CHI -->|SUBSCRIBE| S2
+    CHP -->|SUBSCRIBE| S3
+```
+
+The multiplexer ensures internal events never reach external subscribers unless explicitly routed to the public bus, and public events can be disabled without affecting system synchronisation.
+
+## Characteristics
+
+| Property              | Internal Bus (system)                                      | Public Bus (user)                           |
+|-----------------------|------------------------------------------------------------|---------------------------------------------|
+| **Purpose**           | Cross‑instance synchronisation, internal component updates | External monitoring and integration         |
+| **Activation**        | Always active (required for correct operation)             | Optional – can be enabled/started on demand |
+| **Persistence**       | None – events are not stored                               | None                                        |
+| **Delivery**          | Fire‑and‑forget, no acknowledgment                         | Fire‑and‑forget                             |
+| **History / Replay**  | No                                                         | No                                          |
+| **Channel prefix**    | `redis-smq:events:system:`                                 | `redis-smq:events:user:`                    |
+| **Wire format**       | JSON array of positional arguments                         | JSON array of positional arguments          |
+| **Event routing**     | Depends on routing policy                                  | Depends on routing policy                   |
+
+## Event Routing Policy
+
+The routing policy defines where each event is published. The default targets are:
+
+| Event                         | Target   | Notes                                                       |
+|-------------------------------|----------|-------------------------------------------------------------|
+| `queue.queueCreated`          | `BOTH`   | Internal cache update + public notification                 |
+| `queue.queueDeleted`          | `BOTH`   | Internal cache update + public notification                 |
+| `queue.consumerGroupCreated`  | `BOTH`   | Internal cache update + public notification                 |
+| `queue.consumerGroupDeleted`  | `BOTH`   | Internal cache update + public notification                 |
+| `queue.stateChanged`          | `BOTH`   | Internal consumer reaction + public monitoring              |
+| `configuration.updated`       | `SYSTEM` | Only internal – not exposed publicly                        |
+| All producer events           | `USER`   | Public only – for external monitoring                       |
+| All consumer events           | `USER`   | Public only – for external monitoring                       |
+
+> ⚠️ Producer and consumer events are **not** used for internal synchronisation. They are purely informational and intended for observability.
+
+## Event Payload Format
+
+Events are serialised as a JSON array. Each event has a fixed number of positional arguments whose order and types are documented below.
+
+## Event Reference
+
+### Configuration Events
+
+#### `configuration.updated` – Internal only
+
+Fires when system configuration is saved or updated.
+
+| Argument | Type   | Description                 |
+|----------|--------|-----------------------------|
+| `config` | object | Full configuration object   |
+| `version`| number | Configuration version       |
+
+### Queue Events (routed to BOTH)
+
+#### `queue.queueCreated`
+
+| Argument      | Type   | Description                                                    |
+|---------------|--------|----------------------------------------------------------------|
+| `queue`       | object | `{ ns: string, name: string }`                                |
+| `properties`  | object | Queue properties (type, delivery model, message counts, etc.) |
+
+#### `queue.queueDeleted`
+
+| Argument | Type   | Description                     |
+|----------|--------|---------------------------------|
+| `queue`   | object | `{ ns: string, name: string }` |
+
+#### `queue.stateChanged`
+
+| Argument      | Type   | Description                                                                                         |
+|---------------|--------|-----------------------------------------------------------------------------------------------------|
+| `queue`       | object | `{ ns: string, name: string }`                                                                     |
+| `transition`  | object | State transition object (`from`, `to`, `reason`, `timestamp`, optional `description`/`lockId`/`lockOwner`) |
+
+#### `queue.consumerGroupCreated`
+
+| Argument     | Type   | Description                     |
+|--------------|--------|---------------------------------|
+| `queue`      | object | `{ ns: string, name: string }` |
+| `groupId`    | string | Consumer group identifier       |
+
+#### `queue.consumerGroupDeleted`
+
+| Argument     | Type   | Description                     |
+|--------------|--------|---------------------------------|
+| `queue`      | object | `{ ns: string, name: string }` |
+| `groupId`    | string | Consumer group identifier       |
+
+### Producer Events (USER only)
+
+#### `producer.up`
+
+| Argument      | Type   | Description |
+|---------------|--------|-------------|
+| `producerId`  | string | Producer ID |
+
+#### `producer.goingUp`
+
+| Argument      | Type   | Description |
+|---------------|--------|-------------|
+| `producerId`  | string | Producer ID |
+
+#### `producer.down`
+
+| Argument      | Type   | Description |
+|---------------|--------|-------------|
+| `producerId`  | string | Producer ID |
+
+#### `producer.goingDown`
+
+| Argument      | Type   | Description |
+|---------------|--------|-------------|
+| `producerId`  | string | Producer ID |
+
+#### `producer.messagePublished`
+
+| Argument      | Type   | Description                                                |
+|---------------|--------|------------------------------------------------------------|
+| `messageId`   | string | Published message ID                                       |
+| `queue`       | object | `{ ns: string, name: string }` (destination queue)        |
+| `producerId`  | string | Producer ID                                                |
+
+### Consumer Events (USER only)
+
+#### `consumer.up`
+
+| Argument      | Type   | Description |
+|---------------|--------|-------------|
+| `consumerId`  | string | Consumer ID |
+
+#### `consumer.goingUp`
+
+| Argument      | Type   | Description |
+|---------------|--------|-------------|
+| `consumerId`  | string | Consumer ID |
+
+#### `consumer.down`
+
+| Argument      | Type   | Description |
+|---------------|--------|-------------|
+| `consumerId`  | string | Consumer ID |
+
+#### `consumer.goingDown`
+
+| Argument      | Type   | Description |
+|---------------|--------|-------------|
+| `consumerId`  | string | Consumer ID |
+
+#### `consumer.messageReceived`
+
+| Argument      | Type   | Description                     |
+|---------------|--------|---------------------------------|
+| `messageId`   | string | Message ID                      |
+| `queue`       | object | `{ ns: string, name: string }` |
+| `consumerId`  | string | Consumer ID                     |
+
+#### `consumer.messageAcknowledged`
+
+| Argument      | Type   | Description                     |
+|---------------|--------|---------------------------------|
+| `messageId`   | string | Message ID                      |
+| `queue`       | object | `{ ns: string, name: string }` |
+| `consumerId`  | string | Consumer ID                     |
+
+#### `consumer.messageUnacknowledged`
+
+| Argument      | Type   | Description                     |
+|---------------|--------|---------------------------------|
+| `messageId`   | string | Message ID                      |
+| `queue`       | object | `{ ns: string, name: string }` |
+| `consumerId`  | string | Consumer ID                     |
+| `cause`       | number | Unacknowledgment cause enum     |
+
+#### `consumer.messageDeadLettered`
+
+| Argument      | Type   | Description                     |
+|---------------|--------|---------------------------------|
+| `messageId`   | string | Message ID                      |
+| `queue`       | object | `{ ns: string, name: string }` |
+| `consumerId`  | string | Consumer ID                     |
+| `cause`       | number | Dead‑letter cause enum          |
+
+#### `consumer.messageRequeued`
+
+| Argument      | Type   | Description                     |
+|---------------|--------|---------------------------------|
+| `messageId`   | string | Message ID                      |
+| `queue`       | object | `{ ns: string, name: string }` |
+| `consumerId`  | string | Consumer ID                     |
+
+#### `consumer.messageDelayed`
+
+| Argument      | Type   | Description                     |
+|---------------|--------|---------------------------------|
+| `messageId`   | string | Message ID                      |
+| `queue`       | object | `{ ns: string, name: string }` |
+| `consumerId`  | string | Consumer ID                     |
+
+## Cause Enums
+
+### Unacknowledgment Cause
+
+Used by `consumer.messageUnacknowledged`.
+
+| Value | Name | Description |
+|------:|------|-------------|
+| 0 | `TIMEOUT` | Message consume timeout exceeded. |
+| 1 | `CONSUME_ERROR` | Handler returned an error. |
+| 2 | `UNACKNOWLEDGED` | Message explicitly unacknowledged. |
+| 3 | `OFFLINE_CONSUMER` | Consumer offline; in‑flight messages recovered. |
+| 4 | `SHUTTING_DOWN` | Consumer shut down while processing. |
+| 5 | `TTL_EXPIRED` | Message TTL expired. |
+| 6 | `QUEUE_STOPPED` | Queue stopped while message in flight. |
+| 7 | `QUEUE_INVALID_STATE` | Queue was in invalid state. |
+| 8 | `QUEUE_LOCKED` | Queue locked and operation rejected. |
+| 9 | `MESSAGE_NOT_FOUND` | Message no longer exists. |
+| 10 | `QUEUE_STATE_CHANGED` | Queue state changed during processing. |
+| 11 | `QUEUE_NOT_FOUND` | Queue no longer exists. |
+| 12 | `UNEXPECTED_ERROR` | Unexpected internal error. |
+| 13 | `INVALID_HANDLER_SIGNATURE` | Invalid handler signature. |
+
+### Dead‑Letter Cause
+
+Used by `consumer.messageDeadLettered`.
+
+| Value | Name | Description |
+|------:|------|-------------|
+| 0 | `TTL_EXPIRED` | Message TTL expired. |
+| 1 | `RETRY_THRESHOLD_EXCEEDED` | Message exceeded retry threshold. |
+| 2 | `PERIODIC_MESSAGE` | Periodic message (CRON/repeat) was not retried. |
+
+## Subscribing to Events
+
+- Internal components subscribe to the **system bus** (`redis-smq:events:system:*`).
+- External monitors and integrations subscribe to the **public user bus** (`redis-smq:events:user:*`).
+
+Language implementations provide typed subscription helpers for the public bus. For example:
+
+```go
+// Go example
+queueEvents.SubscribeCreated(func(p queueEvents.CreatedPayload) {
+    // handle created queue
+})
+```
+
+```typescript
+// TypeScript example
+eventBus.on('queue.queueCreated', (queue, properties) => {
+    // handle created queue
+});
+```
+
+The exact API varies by language, but the event names, channel prefixes, and payload formats are identical.
+
+## Best Practices
+
+- Keep event handlers fast; they run synchronously in the subscriber’s event loop.
+- Do not rely on events for guaranteed data delivery; use message audit for persistent records.
+- Unsubscribe when subscriptions are no longer needed.
+- Treat the public bus as optional. If you don’t need external monitoring, you can avoid starting it entirely.
+- Never subscribe to the internal system bus from external code; use the public bus for observability.
