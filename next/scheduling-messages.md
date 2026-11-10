@@ -24,7 +24,7 @@ Publish → CRON schedule → Deliver → Repeat on next CRON tick
 
 **Use for:** daily reports, weekly maintenance jobs, calendar‑based triggers.
 
-CRON expressions use the standard **6‑field** format (seconds are configurable):
+Both the standard **5‑field** Unix format and the **6‑field** format (with seconds) are accepted:
 
 ```
 ┌───────────── second (0–59)
@@ -37,7 +37,7 @@ CRON expressions use the standard **6‑field** format (seconds are configurable
 * * * * * *
 ```
 
-All six fields are required when specifying a CRON expression.
+5‑field expressions are automatically converted to 6‑field by prefixing `0` for the seconds component.
 
 ### Repeating Delivery
 
@@ -49,8 +49,10 @@ Publish → Wait (delay) → Deliver → Wait (period) → Deliver → … → D
 
 **Use for:** periodic health checks, polling tasks, heartbeat signals.
 
-- A repeat count of `0` means **indefinite**.
-- The repeat period is the time between deliveries.
+- A repeat count of `n` (where `n > 0`) schedules **`n` additional deliveries** after the first, for `n + 1` total deliveries.
+- A repeat count of `0` means **no repeats** — the message is delivered once and stops being schedulable. This is the default, and it is also the effective value when the repeat count is never set.
+- The repeat period is the time between deliveries; it applies only when `n > 0`. A repeat period set without a nonzero repeat count is ignored.
+- To repeat a message **indefinitely**, use a CRON expression instead of a repeat count. There is no "infinite repeat" mode via the repeat count itself.
 
 ## Combining Scheduling Options
 
@@ -79,11 +81,11 @@ flowchart TD
 
 - Every time a scheduled message becomes due, the system checks repeats first.
 - **If repeats remain:**
-    - On a CRON tick, a CRON copy is delivered and the repeat counter resets.
-    - Between CRON ticks, repeat copies are delivered at the configured period.
+  - On a CRON tick, a CRON copy is delivered and the repeat counter resets.
+  - Between CRON ticks, repeat copies are delivered at the configured period.
 - **If repeats are exhausted (or there is no repeat):**
-    - With a CRON, the next CRON tick is scheduled.
-    - Without a CRON, the schedule ends.
+  - With a CRON, the next CRON tick is scheduled.
+  - Without a CRON, the schedule ends.
 
 This reflects the actual logic in the scheduler, where `NextScheduledTimestamp()` gives priority to delays, then picks the earlier of the next CRON tick or the next repeat delivery, resetting or incrementing the repeat counter as appropriate.
 
