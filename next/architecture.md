@@ -29,21 +29,31 @@ flowchart TB
         Manager["Manager\n[Container: language runtime]\nCRUD for queues, messages,\nexchanges, consumer groups,\nand configuration"]
     end
 
+    subgraph Runtime["Process-Scoped Runtime\n[Container: language runtime]\nSpawned once per process by Init"]
+        Coordinator["Coordinator\n[Component]\nPer-queue WorkersLock election;\nspawns per-queue worker sets"]
+        PurgeWorker["Purge Worker\n[Component]\nCompeting consumer over\nPendingPurgeJobs"]
+    end
+
     Redis["Redis Database\n[Container: Redis]\nStores all data, executes\nLua scripts, provides Pub/Sub"]
 
     Producer -->|"publish"| Redis
     Consumer -->|"consume, ack/unack"| Redis
     Manager -->|"CRUD operations"| Redis
+    Coordinator -->|"SETNX, Lua EVAL, lease refresh"| Redis
+    PurgeWorker -->|"BRPopLPush, Lua EVAL"| Redis
 
     Redis -.->|"state change events"| Producer
     Redis -.->|"state change events"| Consumer
     Redis -.->|"state change events"| Manager
+    Redis -.->|"state change events"| Coordinator
     Producer -.->|"publish events"| Redis
     Consumer -.->|"publish events"| Redis
     Manager -.->|"publish events"| Redis
 ```
 
 > **Note:** Event Bus is Redis Pub/Sub, a built‑in capability of Redis. It is not a separate deployable container.
+
+> **Note:** The Coordinator and Purge Worker are *process-scoped*: they run once per application process (spawned by `Init`), not per consumer instance. They coordinate themselves cluster-wide via Redis locks. See [Background Workers](#background-workers) below.
 
 ---
 
@@ -56,6 +66,11 @@ flowchart TB
         Producer["Producer"]
         Consumer["Consumer"]
         Manager["Manager (CRUD)"]
+    end
+
+    subgraph Runtime["Process-Scoped Runtime"]
+        Coordinator["Coordinator"]
+        PurgeWorker["Purge Worker"]
     end
 
     subgraph Redis["Redis"]
@@ -75,6 +90,8 @@ flowchart TB
     Manager -->|"manage"| Messages
     Manager -->|"manage"| Exchanges
     Manager -->|"manage"| Configuration
+    Coordinator -->|"elected per queue\nspawns worker set"| Queues
+    PurgeWorker -->|"competes for\npurge jobs"| Queues
     Queues -->|"store/retrieve"| Messages
     Exchanges -->|"resolve to"| Queues
     Lua -->|"atomic ops on"| Queues
@@ -129,11 +146,11 @@ flowchart LR
     style note1 fill:#f9f9f9,stroke:#ccc,stroke-dasharray: 5 5
 ```
 
-#### Consumer Container – Message Handling & Background Workers
+#### Consumer Container – Message Handling
 
 ```mermaid
 flowchart TB
-    subgraph Consumer["Consumer Container"]
+    subgraph Consumer["Consumer Container (one per consumer instance)"]
         MH["MessageHandler\n[Component]\nOrchestrates the dequeue\nand processing loop"]
         DQ["DequeueMessage\n[Component]\nAtomically moves a message\nfrom pending to processing"]
         CM["ConsumeMessage\n[Component]\nInvokes the user handler,\nhandles ack/unack/panic"]
@@ -143,7 +160,7 @@ flowchart TB
         Event["Publish Events\n[Component]\nEmits consumer events\nvia Redis Pub/Sub"]
     end
 
-    subgraph Workers["Background Workers\n[Components]\nRun only after acquiring\nthe per‑queue worker lock"]
+    subgraph Coordinator["Coordinator (process-scoped)\n[Component]\nElects one process per queue\nvia WorkersLock; spawns the\nper-queue worker set for\nqueues it holds"]
         SP["Scheduled Publisher\n(every 5s)\nMoves due scheduled\nmessages to pending"]
         IR["Immediate Requeuer\n(every 5s)\nRe‑inserts requeued\nmessages into pending"]
         DR["Delayed Requeuer\n(every 5s)\nMoves delayed messages\nwhose time has come"]
@@ -189,7 +206,7 @@ flowchart TB
     BU -->|"consumer.messageDelayed"| Event
     Event -->|"publish to Redis Pub/Sub"| Redis
 
-    note1["Lifecycle events (consumer.up, consumer.down,\nconsumer.goingUp, consumer.goingDown) are\npublished directly by the Consumer container\nat startup/shutdown and are not shown here."]
+    note1["Lifecycle events (consumer.up, consumer.down,\nconsumer.goingUp, consumer.goingDown) are\npublished directly by the Consumer container\nat startup/shutdown and are not shown here.\n\nThe Coordinator is spawned once per process,\nnot per consumer. A process holding no queue\nleases still runs the Coordinator (it just has\nnothing to spawn)."]
     style note1 fill:#f9f9f9,stroke:#ccc,stroke-dasharray: 5 5
 ```
 
@@ -248,9 +265,9 @@ flowchart LR
     Event -->|"publish to Redis Pub/Sub"| Redis
 ```
 
-The management layer is split into specialised managers, each responsible for a single domain (queues, messages, exchanges, consumer groups, configuration). 
+The management layer is split into specialised managers, each responsible for a single domain (queues, messages, exchanges, consumer groups, configuration).
 
-Every implementation provides its own set of managers that share the same underlying Redis schema and Lua scripts. 
+Every implementation provides its own set of managers that share the same underlying Redis schema and Lua scripts.
 
 Managers publish events when resources are created, modified, or deleted, enabling real‑time cross‑instance synchronisation.
 
@@ -424,16 +441,6 @@ A consumer receives and processes messages. Each consumer:
 - Sends heartbeats to indicate liveness
 - Acknowledges or rejects messages
 
-Internally, a consumer has background workers that run only if the consumer acquires a per-queue worker lock:
-
-- **Scheduled Publisher** — Moves due scheduled messages to pending
-- **Immediate Requeuer** — Requeues failed messages immediately
-- **Delayed Requeuer** — Requeues failed messages after a delay
-- **Reaper** — Detects dead consumers and recovers their messages
-- **Lock Recoverer** — Unlocks queues stuck in Locked state
-
-The worker lock ensures only one consumer per queue runs these background tasks.
-
 ### Managers
 
 Managers provide CRUD operations for queues, messages, exchanges, consumer groups, and configuration. They are stateless — each operation reads from and writes to Redis directly.
@@ -512,32 +519,37 @@ sequenceDiagram
 5. **On failure:** The message is unacknowledged via `unacknowledge‑message.lua`. Based on the retry policy, the message is moved to the requeue list, delayed sorted set, or dead‑letter queue. Corresponding events (`consumer.messageUnacknowledged`, `consumer.messageDeadLettered`, `consumer.messageRequeued`, or `consumer.messageDelayed`) are emitted.
 6. If the consumer crashes without acknowledging, the **Reaper** (a background worker running on another consumer) detects the dead consumer, recovers the in‑flight message via the same unacknowledge script, and makes it available for another consumer.
 
-### Background Workers (Processing Flow)
+### Background Workers (Message-Processing)
 
-Scheduled messages and retried messages are processed by background workers that run inside the consumer after acquiring a per‑queue worker lock.
+The three message-processing workers run on the **normal path** — scheduled messages becoming due, retried messages becoming ready for another attempt, and delayed messages whose retry delay has elapsed. They run every 5 seconds (default) on the process holding the queue's `WorkersLock` lease.
+
+The other two per-queue workers (Reaper, Lock Recoverer) run on the **failure path**, not the message path, and are covered in the main [Background Workers](#background-workers) section.
 
 ```mermaid
 sequenceDiagram
+    participant Crd as Coordinator (process-scoped)
     participant SP as Scheduled Publisher
     participant IR as Immediate Requeuer
     participant DR as Delayed Requeuer
     participant Redis as Redis
 
-    loop Every 5 seconds
+    Note over Crd,Redis: Coordinator acquires the queue's WorkersLock<br/>(SETNX). One process per queue holds the lease.
+
+    loop Every 5 seconds (holder only)
         SP->>Redis: ZRANGEBYSCORE (scheduled, ≤ now)
         Redis-->>SP: due message IDs
         SP->>Redis: EVAL publish‑scheduled.lua
         Redis-->>Redis: Move to pending / create repeat
     end
 
-    loop Every 5 seconds
+    loop Every 5 seconds (holder only)
         IR->>Redis: LRANGE (requeued, 0, 99)
         Redis-->>IR: message IDs
         IR->>Redis: EVAL requeue‑immediate.lua
         Redis-->>Redis: Move to pending or delayed
     end
 
-    loop Every 5 seconds
+    loop Every 5 seconds (holder only)
         DR->>Redis: ZRANGEBYSCORE (delayed, ≤ now)
         Redis-->>DR: due message IDs
         DR->>Redis: EVAL requeue‑delayed.lua
@@ -545,7 +557,13 @@ sequenceDiagram
     end
 ```
 
----
+Three workers, one flow:
+
+- **Scheduled Publisher** — moves due scheduled messages (delays, CRON ticks, repeat deliveries) into pending. For repeating messages, creates a child for the current delivery and reschedules the parent for its next tick.
+- **Immediate Requeuer** — moves messages from the `req` list into pending (no retry delay) or delayed (retry delay > 0).
+- **Delayed Requeuer** — moves messages whose retry delay has elapsed from the `dly` sorted set into pending.
+
+All three are gated by Lua-level `LREM`/`ZREM` checks so that during the ~10-second split-brain window after a lease loss, only one executor transitions each message.
 
 ## Redis Data Model
 
@@ -700,25 +718,26 @@ Scripts that modify data validate preconditions (queue state, lock ownership, ve
 
 ## Cross‑Instance Communication
 
-The event bus uses Redis pub/sub to synchronize state across instances in real time. It is an internal mechanism—not a public API—but external monitors can also subscribe to observe system activity.
+The event bus uses Redis pub/sub to synchronize state across instances in real time. It is an internal mechanism — not a public API — but external monitors can also subscribe to observe system activity.
 
 **What the event bus synchronizes:**
 
-- **Queue lifecycle** — when a queue is created or deleted, producers that maintain a Pub/Sub consumer group cache are notified so they can start or stop tracking the queue.
+- **Queue lifecycle** — when a queue is created or deleted, producers that maintain a Pub/Sub consumer group cache are notified so they can start or stop tracking the queue. The **Coordinator** is also notified so it can attempt to spawn workers for the new queue.
 - **Queue state changes** — when a queue is paused, resumed, stopped, or locked, consumers are notified so they can stop or start their message handlers accordingly.
 - **Consumer group changes** — when a consumer group is created or deleted for a Pub/Sub queue, the producer’s local cache is updated so it knows how many copies of each message to create.
 - **Configuration updates** — when configuration is saved, all instances receive the updated settings without needing to restart.
 
 **Characteristics:**
 
+- **System bus: always active** — required for the Coordinator's event-driven queue discovery, producer cache updates, and consumer state tracking. There is no mode where it is disabled.
+- **User bus: optional** — external subscribers only receive events if the user bus has been started explicitly. See [Event Bus](event-bus.md).
 - **Fire‑and‑forget** — events are not persisted. If no subscriber is listening, the event is lost.
 - **No delivery guarantees** — there is no acknowledgment or retry mechanism for events.
 - **Real‑time only** — subscribers only receive events published after they subscribe. There is no history or replay.
-- **Optional** — the event bus is disabled by default. Disabling it reduces Redis load but means that cross‑instance state changes (e.g., queue pausing) will not propagate automatically.
 
 **Recovery from missed events:**
 
-If an instance misses an event (e.g., it was temporarily disconnected), it can rebuild its local state by reading the authoritative data from Redis. For example, a producer can reload its consumer group cache by scanning all Pub/Sub queues. A consumer can check a queue’s current operational state before starting to consume.
+If an instance misses an event (e.g., it was temporarily disconnected), it can rebuild its local state by reading the authoritative data from Redis. For example, a producer can reload its consumer group cache by scanning all Pub/Sub queues. A consumer can check a queue’s current operational state before starting to consume. The Coordinator's 30s sweep of `AllQueues` catches queues whose `queueCreated` event was missed.
 
 > The event bus is complementary to the data stored in Redis. Redis is always the source of truth; the event bus simply makes state changes visible in real time.
 
@@ -726,28 +745,124 @@ If an instance misses an event (e.g., it was temporarily disconnected), it can r
 
 ## Background Workers
 
-### Per-Queue Workers (Consumer)
+RedisSMQ's background work splits into three structural groups:
 
-Acquired via distributed lock. Only one consumer per queue runs these:
+| Group | What it does | Started by | Scope |
+|-------|-------------|------------|-------|
+| **Message-processing workers** | Move messages between queue categories (scheduled → pending, requeued → pending, delayed → pending) | Coordinator | One process per queue (elected via `WorkersLock`) |
+| **Recovery workers** | Recover in-flight messages from dead consumers; unlock queues whose purge worker died | Coordinator | One process per queue (elected via `WorkersLock`) |
+| **Purge worker** | Execute discrete purge jobs (delete N messages of a category) | Runtime initialization | One background task per process, competing over a shared job queue |
 
-- **Scheduled Publisher** — Every 5 seconds, checks for due scheduled messages
-- **Immediate Requeuer** — Every 5 seconds, moves requeued messages to pending
-- **Delayed Requeuer** — Every 5 seconds, moves delayed messages whose time has come
-- **Reaper** — Every 30 seconds, checks for dead consumers and recovers their messages
-- **Lock Recoverer** — Every 30 seconds, unlocks queues stuck in Locked state
+The message-processing workers participate in message delivery and are described under [Message Flow → Background Workers (Message-Processing)](#background-workers-message-processing). This section covers **the remaining workers and components**: the process-scoped Coordinator and Purge Worker, the two recovery workers spawned by the Coordinator, and the per-consumer Heartbeat and Supervisor.
+
+The two groups of per-queue workers (message-processing + recovery) are spawned by the same Coordinator, share the same `WorkersLock` election, and are torn down together. The purge worker is a separate pattern and runs independently.
+
+### Process-Scoped Components
+
+Started once per application process by the runtime initialization phase. They are distinct from per-consumer workers and from the per-queue workers they spawn.
+
+#### Coordinator
+
+Discovers live queues (event-driven on `queue.queueCreated`, plus a 30-second sweep of the global queue registry as a fallback for dropped events). For each queue, attempts to acquire a cluster-wide `WorkersLock` lease via `SETNX` with a TTL. The holder starts **five** workers for that queue — three message-processing workers (Scheduled Publisher, Immediate Requeuer, Delayed Requeuer) and two recovery workers (Reaper, Lock Recoverer); non-holders do nothing.
+
+Lease loss (detected by the periodic `ExtendLock` refresh returning 0, which means another process acquired the key after our TTL expired) triggers cancellation of the holder's worker set; the next reconcile tick on any process re-elects. Exactly one process runs each queue's full worker set at a time, cluster-wide.
+
+The five-worker-per-queue design is deliberate: the lease lifecycle is a single unit, so there is no way for one worker for a queue to be running without the others. The lease refresh cadence (default 10 seconds) bounds the split-brain window to ≤10 seconds; the per-message Lua gates in every worker make that window harmless.
+
+#### Purge Worker
+
+A competing-consumer worker that pops purge jobs from `PendingPurgeJobs` via `BRPopLPush`. One background task per process; N processes → N concurrent purges. Job-level recovery via heartbeat (`WorkerHeartbeat` key with TTL) — if the worker crashes mid-job, `recover-stuck-job.lua` re-queues the job on the next recovery cycle, preserving the job's `Meta.Purged` progress.
+
+The purge worker runs independently of the Coordinator. Purge jobs are discrete, finite work items (delete N messages of a specific category from a queue); they don't fit the periodic-ticker model of the Coordinator's workers. See [Background Work Patterns](#background-work-patterns) below for why the two patterns must stay separate.
+
+### Recovery Workers (Coordinator-Elected)
+
+Started by the Coordinator alongside the three message-processing workers. One process per queue holds the queue's `WorkersLock` and runs both recovery workers. They run every 30 seconds (default — twice the message-processing cadence, since recovery is not latency-sensitive).
+
+```mermaid
+sequenceDiagram
+    participant Crd as Coordinator (process-scoped)
+    participant RC as Reaper
+    participant OLR as Lock Recoverer
+    participant Redis as Redis
+
+    Note over Crd,Redis: Same WorkersLock election as the message-processing flow.
+
+    loop Every 30 seconds (holder only)
+        RC->>Redis: HKEYS (Consumers hash)
+        Redis-->>RC: consumer IDs
+        RC->>Redis: MGET (ConsumerHeartbeat keys)
+        Redis-->>RC: liveness map
+        alt Dead consumer detected
+            RC->>Redis: EVAL unacknowledge-message.lua<br/>(recover in-flight messages)
+            RC->>Redis: delete ephemeral group (if any)
+            RC->>Redis: SREM from every ConsumerGroupMembers
+        end
+    end
+
+    loop Every 30 seconds (holder only)
+        OLR->>Redis: HGET (queue OperationalState)
+        Redis-->>OLR: state
+        alt Queue is Locked by a purge job
+            OLR->>Redis: GET (JobWorker → workerID)
+            OLR->>Redis: EXISTS (WorkerHeartbeat)
+            alt Worker is dead
+                OLR->>Redis: EVAL set-queue-state.lua<br/>(unlock queue)
+            end
+        end
+    end
+```
+
+#### Reaper
+
+Detects consumers whose heartbeat key has expired (heartbeat TTL is 30–60 seconds by default) and recovers their in-flight messages:
+
+1. Atomically unacknowledges every message in the dead consumer's `ConsumerProcessing` list, routing each through the standard retry pipeline (requeue / delay / dead-letter based on each message's retry policy).
+2. Publishes `consumer.messageUnacknowledged` plus the corresponding action event (dead-lettered / requeued / delayed) for every message the Lua actually transitioned. Messages the Lua skipped (already removed from `ConsumerProcessing` by a peer) do **not** get events — there was no transition to report.
+3. Deletes the dead consumer's ephemeral consumer group, if one was in use.
+4. Removes the dead consumer from every consumer group's member set on the queue — this is what makes deleting the consumer group succeed after a consumer crash. Without it, an explicit-group consumer that crashed would leave the group unremovable forever.
+5. Removes the dead consumer's registration from the queue's `Consumers` hash.
+
+All steps are gated by Lua-level checks (`LREM` on the processing list, `SREM` on group member sets) and are idempotent. Concurrent execution during the ~10-second split-brain window that follows a lease loss is safe — only one executor transitions each message.
+
+#### Lock Recoverer
+
+Detects queues stuck in `Locked` state because the purge worker that locked them died mid-job. For each locked queue whose lock owner is `LockOwnerPurgeJob`:
+
+1. Reads the lock ID (equal to the purge job ID).
+2. Checks whether the worker that started the job is still alive via `JobWorker` → `WorkerHeartbeat` key existence.
+3. If the worker is dead, atomically transitions the queue `Locked → Active` with reason `PURGE_QUEUE_COMPLETE` via `set-queue-state.lua`.
+
+The Lua script's `expectedPreviousState` check gates concurrent unlock attempts — only one executor transitions the queue; others get a non-OK reply and log at debug level. Without this worker, a crashed purge would leave the queue `Locked` indefinitely on a single-node deployment, blocking all consumes and produces for that queue.
 
 ### Per-Consumer Workers
 
-- **Heartbeat** — Every TTL/3 seconds, updates the consumer's heartbeat key
-- **Supervisor** — Every 5 seconds, reconciles message handlers with queue states
+Run inside each consumer instance, independent of the Coordinator and the process-scoped workers:
 
----
+- **Heartbeat** — every `HeartbeatTTL/3` seconds, updates the consumer's heartbeat key (`main:cons:{id}:hb`) with a fresh TTL. The reaper detects dead consumers by the absence of this key. The first heartbeat is written synchronously before the heartbeat task starts, so a consumer is never visible in the `Consumers` hash without a corresponding heartbeat.
+- **Supervisor** — every 5 seconds, reconciles message handlers with queue states. Restarts handlers for queues that became active since the last reconcile; the state-change events for pause/stop/resume handle the common case, and the supervisor catches any that were missed.
+
+### Background Work Patterns
+
+The two process-scoped components (Coordinator, Purge Worker) represent two different distributed-systems patterns. New background work must fit one or the other.
+
+- **Leader election per queue** (Coordinator) — the correct primitive for periodic tickers that would be redundant if every process ran them. Used for the three message-processing workers (normal path) and the two recovery workers (failure path).
+- **Competing consumers over a work queue** (Purge Worker) — the correct primitive for discrete, finite jobs enqueued by arbitrary callers. Used for purge jobs.
+
+Merging the two would force one pattern to simulate the other at a cost — idle blocked workers if the ticker pattern were used for jobs, or spurious lease churn if the job-queue pattern were used for tickers.
+
+The invariant each pattern enforces is different and cannot be replaced by the other:
+
+- **Leader election** enforces "exactly one process at a time does this periodic work per queue."
+- **Competing consumers** enforces "exactly one process ever does this job."
+
+A periodic ticker that ran on every process would violate the first invariant (redundant work). A job executed by every process that happened to notice it would violate the second (duplicate execution). The choice of pattern is therefore not stylistic — it is a correctness requirement tied to the semantics of the work.
 
 ## Error Handling
 
 RedisSMQ is designed to be resilient to errors at every layer. The approach is consistent across all implementations:
 
-- **Lua scripts** — Return error codes for known conditions (e.g., queue not found, queue locked, invalid state).  Callers translate these codes into typed errors.
+- **Lua scripts** — Return error codes for known conditions (e.g., queue not found, queue locked, invalid state). Callers translate these codes into typed errors.
 - **Error propagation** — Errors are enriched with context at each layer (e.g., operation name, queue name, message ID) to aid debugging.
 - **Background workers** — Errors in periodic tasks (scheduler, reaper, etc.) are logged but do not interrupt the worker; the worker continues its next cycle.
 - **Event bus** — Operational events (e.g., `consumer.messageDeadLettered`, `consumer.messageUnacknowledged`) allow external monitors to detect and react to failures.
