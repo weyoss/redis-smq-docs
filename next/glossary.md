@@ -27,7 +27,7 @@
 | **Ephemeral Group** | A consumer group created automatically for a single consumer, deleted when the consumer shuts down.                      |
 | **Queue State**     | The operational mode of a queue: **Active**, **Paused**, **Stopped**, or **Locked**.                                     |
 | **Rate Limiting**   | Controlling the maximum number of messages delivered from a queue within a time window.                                  |
-| **Worker Lock**     | A distributed lock that ensures only one consumer per queue runs background workers (scheduler, reaper, etc.).           |
+| **Worker Lock** | A distributed lock (`wlock`) held per queue, elected cluster-wide by the process-scoped Coordinator. Ensures exactly one process runs a queue's five background workers (scheduler, requeuers, reaper, lock recoverer) at a time. |
 
 ## Message Lifecycle
 
@@ -57,6 +57,8 @@
 | **Reaper**                 | A background worker that detects dead consumers (by missing heartbeats) and recovers their in‑flight messages.                    |
 | **Idempotency**            | The property that processing the same message multiple times produces the same side‑effects.                                      |
 | **Batch Acknowledgment**   | Grouping multiple acknowledgments into a single Redis operation for higher throughput.                                            |
+| **Coordinator** | A process-scoped component that discovers live queues, elects one process per queue via the Worker Lock, and spawns that queue's five background workers. Re-elected when a lease expires. |
+| **Purge Worker** | A process-scoped competing consumer that pops purge jobs from `PendingPurgeJobs` via `BRPopLPush`. Distinct from the Coordinator's periodic workers — purge jobs are discrete, finite work items. |
 
 ## Management & Audit
 
