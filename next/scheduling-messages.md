@@ -1,6 +1,6 @@
 # Scheduling Messages
 
-Messages can be scheduled for future delivery. RedisSMQ supports one‑time delays, calendar‑based CRON schedules, and repeating delivery. A background scheduler (running inside every active consumer) periodically moves due messages from the scheduled queue to the pending queue.
+Messages can be scheduled for future delivery. RedisSMQ supports one‑time delays, calendar‑based CRON schedules, and repeating delivery. A background scheduler — elected per queue across the cluster — periodically moves due messages from the scheduled queue to the pending queue.
 
 ## Scheduling Types
 
@@ -58,9 +58,9 @@ Publish → Wait (delay) → Deliver → Wait (period) → Deliver → … → D
 
 All three options can be combined. The order of evaluation for each delivery is:
 
-1. **Delay** – If set, the message waits for the delay before its first delivery.  
-2. **CRON** – If set, it controls the delivery cadence. Within a CRON cycle, repeats use the repeat period.  
-3. **Repeat** – If set, the message is delivered multiple times.
+1. **Delay** — If set, the message waits for the delay before its first delivery.
+2. **CRON** — If set, it controls the delivery cadence. Within a CRON cycle, repeats use the repeat period.
+3. **Repeat** — If set, the message is delivered multiple times.
 
 ```mermaid
 flowchart TD
@@ -104,11 +104,11 @@ This reflects the actual logic in the scheduler, where `NextScheduledTimestamp()
 sequenceDiagram
     participant P as Producer
     participant Redis as Redis
-    participant Scheduler as Scheduler (background worker)
+    participant Scheduler as Scheduler (coordinator-elected, one process per queue)
     participant C as Consumer
 
     P->>Redis: publish‑message.lua (add to SCHEDULED sorted set)
-    loop Every 5 seconds
+    loop Every 5 seconds (holding process only)
         Scheduler->>Redis: ZRANGEBYSCORE (scheduled, ≤ now)
         Redis-->>Scheduler: due message IDs
         Scheduler->>Redis: publish‑scheduled.lua
@@ -123,7 +123,8 @@ sequenceDiagram
     end
 ```
 
-- The scheduler runs every 5 seconds.
+- The scheduler is a background worker elected **per queue across the cluster** — one process per queue holds the queue's `WorkersLock` lease and runs the scheduler; all other processes leave that queue alone until the holder's lease expires or is released.
+- The scheduler runs every 5 seconds (default cadence; configurable per implementation).
 - Up to 99 messages are processed per tick.
 - Repeating messages are rescheduled atomically: a new child message is created for the current delivery, and the original is updated for the next tick.
 
@@ -131,16 +132,16 @@ sequenceDiagram
 
 Scheduled messages can be inspected and cancelled before delivery:
 
-- **Browse** – List all scheduled messages for a queue.
-- **Delete** – Remove a scheduled message by ID to prevent delivery.
-- **Purge** – Remove all scheduled messages via a background purge job.
+- **Browse** — List all scheduled messages for a queue.
+- **Delete** — Remove a scheduled message by ID to prevent delivery.
+- **Purge** — Remove all scheduled messages via a background purge job.
 
-A scheduled message that has been delivered becomes a regular pending message. It can then be acknowledged, retried, etc., but cannot be “un‑delivered” – you must delete it if you no longer want it.
+A scheduled message that has been delivered becomes a regular pending message. It can then be acknowledged, retried, etc., but cannot be "un‑delivered" – you must delete it if you no longer want it.
 
 ## Important Notes
 
 - Scheduled messages are stored in a **sorted set** ordered by delivery timestamp.
-- The scheduler is a background worker inside every consumer that holds the queue’s worker lock.
+- The scheduler is a background worker elected per queue across the cluster — exactly one process runs it per queue at a time, so repeating messages are never cloned twice.
 - Scheduling works with **all queue types** (FIFO, LIFO, Priority) and both delivery models (Point‑to‑Point, Pub/Sub).
 - CRON expressions are validated at set time; **invalid expressions are silently ignored** (the message is published as an immediate, non‑scheduled message).
 - Repeating messages that fail are **dead‑lettered immediately** (they are not retried). The next scheduled instance is delivered as usual.
