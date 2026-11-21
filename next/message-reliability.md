@@ -23,7 +23,7 @@ If a consumer crashes before acknowledging, the message remains in the processin
 
 ### Consumer Heartbeats
 
-Each consumer sends periodic heartbeats to Redis. If heartbeats stop, the consumer is considered dead. A background worker detects dead consumers and recovers their in-flight messages, returning them to the pending queue for other consumers to process.
+Each consumer sends periodic heartbeats to Redis. If heartbeats stop, the consumer is considered dead. A background worker (the **reaper**, elected per queue by the process-scoped Coordinator) detects dead consumers and recovers their in-flight messages, returning them to the pending queue for other consumers to process.
 
 ### Consumption Timeout
 
@@ -75,7 +75,7 @@ Messages that cannot be processed after all retries are moved to the dead-letter
 sequenceDiagram
     participant C1 as Consumer 1 (crashes)
     participant Redis as Redis
-    participant Reaper as Reaper (background worker)
+    participant Reaper as Reaper (coordinator-elected, one per queue)
     participant C2 as Consumer 2
 
     C1->>Redis: processes message (in processing queue)
@@ -101,7 +101,7 @@ sequenceDiagram
 sequenceDiagram
     participant C1 as Consumer 1
     participant Redis as Redis
-    participant Reaper as Reaper / Timeout
+    participant Reaper as Reaper / Timeout (coordinator-elected)
     participant C2 as Consumer 2
 
     C1->>Redis: dequeue message (moves to processing)
