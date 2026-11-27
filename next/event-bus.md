@@ -2,8 +2,8 @@
 
 RedisSMQ uses Redis Pub/Sub to deliver real‑time notifications about system activity. There are **two independent event buses**:
 
-- **Internal Event Bus (system)** – always active, used for cross‑instance synchronisation and internal component communication.
-- **Public Event Bus (user)** – optional, intended for external monitoring and integration.
+- **Internal Event Bus (system)** — always active, used for cross‑instance synchronisation and internal component communication.
+- **Public Event Bus (user)** — optional, intended for external monitoring and integration.
 
 An **event multiplexer** routes each event to one or both buses based on a static routing policy.
 
@@ -26,8 +26,9 @@ flowchart LR
     subgraph Publishers
         P1[Producer]
         P2[Consumer]
-        P3[Manager]  
+        P3[Manager]
         P4[Coordinator]
+        P5[Scheduler]
     end
 
     subgraph Multiplexer["Event Multiplexer"]
@@ -52,6 +53,7 @@ flowchart LR
     P2 -->|event| ROUTE
     P3 -->|event| ROUTE
     P4 -->|event| ROUTE
+    P5 -->|event| ROUTE
 
     ROUTE -->|SYSTEM| CHI
     ROUTE -->|USER| CHP
@@ -70,8 +72,8 @@ The multiplexer ensures internal events never reach external subscribers unless 
 | Property              | Internal Bus (system)                                      | Public Bus (user)                           |
 |-----------------------|------------------------------------------------------------|---------------------------------------------|
 | **Purpose**           | Cross‑instance synchronisation, internal component updates | External monitoring and integration         |
-| **Activation**        | Always active (required for correct operation)             | Optional – started on demand                |
-| **Persistence**       | None – events are not stored                               | None                                        |
+| **Activation**        | Always active (required for correct operation)             | Optional — started on demand                |
+| **Persistence**       | None — events are not stored                               | None                                        |
 | **Delivery**          | Fire‑and‑forget, no acknowledgment                         | Fire‑and‑forget                             |
 | **History / Replay**  | No                                                         | No                                          |
 | **Channel prefix**    | `redis-smq:events:system:`                                 | `redis-smq:events:user:`                    |
@@ -89,11 +91,55 @@ The routing policy defines where each event is published. The default targets ar
 | `queue.consumerGroupCreated`  | `BOTH`   | Internal cache update + public notification                 |
 | `queue.consumerGroupDeleted`  | `BOTH`   | Internal cache update + public notification                 |
 | `queue.stateChanged`          | `BOTH`   | Internal consumer reaction + public monitoring              |
-| `configuration.updated`       | `SYSTEM` | Only internal – not exposed publicly                        |
-| All producer events           | `USER`   | Public only – for external monitoring                       |
-| All consumer events           | `USER`   | Public only – for external monitoring                       |
+| `configuration.updated`       | `SYSTEM` | Only internal — not exposed publicly                        |
+| All producer events           | `USER`   | Public only — for external monitoring                       |
+| All scheduler events          | `USER`   | Public only — for external monitoring                       |
+| All consumer events           | `USER`   | Public only — for external monitoring                       |
 
-> ⚠️ Producer and consumer events are **not** used for internal synchronisation. They are purely informational and intended for observability.
+> ⚠️ Producer, scheduler, and consumer events are **not** used for internal synchronisation. They are purely informational and intended for observability.
+
+## Event Taxonomy
+
+Messages reach the system through two flows, and the public event taxonomy reflects that split:
+
+| Flow      | Produce-time event          | Fire-time event(s)                                                          |
+|-----------|-----------------------------|-----------------------------------------------------------------------------|
+| Immediate | `producer.messagePublished` | *(none — the message is pending as soon as it is produced)*                 |
+| Scheduled | `producer.messageScheduled` | `scheduler.messagePublished` **or** `scheduler.messageDeadLettered`         |
+
+- **Producer events** fire when `produce` succeeds. One event per destination queue, multiplied by the number of consumer groups for Pub/Sub destinations — matching the number of IDs the produce call returns.
+- **Scheduler events** fire later, whenever the scheduled message becomes due. That may be milliseconds after produce, hours later, or never (if the message is cancelled, deleted, or the queue is dropped before its due time).
+
+> ⚠️ **Breaking change.** `producer.messagePublished` no longer fires for scheduled messages becoming pending. Subscribers that relied on that signal (the pre-change scheduled publisher emitted `producer.messagePublished` with an empty `producerId`) should migrate to `scheduler.messagePublished`. No other event's semantics changed.
+
+### Full lifecycle of a scheduled message
+
+For a repeating scheduled message with `repeat = 2`, the event sequence
+depends on whether a delay is set.
+
+**With a delay** (e.g. `SetScheduledDelay(10 * time.Second)`):
+
+```
+producer.messageScheduled         ← produce returns
+scheduler.messagePublished        ← clone 1 (at produce+10s)
+scheduler.messagePublished        ← clone 2 (10s + repeat period)
+scheduler.messagePublished        ← parent moved to pending
+3 events total.
+```
+
+**Without a delay**:
+
+```
+producer.messageScheduled         ← produce returns
+scheduler.messagePublished        ← clone 1 (immediate)
+scheduler.messagePublished        ← parent moved to pending
+2 events total.
+```
+
+Note the one-event difference: without a delay, the initial scheduled
+entry is counted as the first repeat, so `repeat = N` yields N total
+events. With a delay, the delay itself is not counted as a repeat, so
+`repeat = N` yields N + 1 total events.
 
 ## Event Payload Format
 
@@ -103,7 +149,7 @@ Events are serialised as a JSON array. Each event has a fixed number of position
 
 ### Configuration Events
 
-#### `configuration.updated` – Internal only
+#### `configuration.updated` — Internal only
 
 Fires when system configuration is saved or updated.
 
@@ -184,11 +230,59 @@ Fires when system configuration is saved or updated.
 
 #### `producer.messagePublished`
 
+Fires when an **immediate** (non-scheduled) produce succeeds — one event per destination queue, multiplied by the number of consumer groups for Pub/Sub destinations.
+
+Does **not** fire for scheduled produces; see `producer.messageScheduled` below.
+
 | Argument      | Type   | Description                                                |
 |---------------|--------|------------------------------------------------------------|
 | `messageId`   | string | Published message ID                                       |
 | `queue`       | object | `{ queueParams: { ns, name }, groupId }` (destination)     |
-| `producerId`  | string | Producer ID. **Empty string** when the message was moved to pending by the scheduled publisher (delay/CRON/repeat tick) — the publisher is not a producer. |
+| `producerId`  | string | Producer ID                                                |
+
+#### `producer.messageScheduled`
+
+Fires when a **scheduled** produce succeeds — one event per destination queue, multiplied by the number of consumer groups for Pub/Sub destinations. The message has entered the scheduled set; its due time is set (delay, CRON, repeat) but not yet reached.
+
+Does **not** fire for immediate produces; see `producer.messagePublished` above.
+
+For a repeating message, this fires once — for the parent. Clones created by subsequent repeat ticks each fire `scheduler.messagePublished` (see below), not `producer.messageScheduled`.
+
+| Argument      | Type   | Description                                                |
+|---------------|--------|------------------------------------------------------------|
+| `messageId`   | string | Message ID                                                 |
+| `queue`       | object | `{ queueParams: { ns, name }, groupId }` (destination)     |
+| `producerId`  | string | Producer ID                                                |
+
+### Scheduler Events (USER only)
+
+Scheduler events fire when a scheduled message becomes due. They do **not** carry a `producerId` — the scheduler is not a producer, and by the time a message's due time arrives the originating producer may have long since shut down.
+
+#### `scheduler.messagePublished`
+
+Fires when the scheduler moves a due scheduled message into a pending list, ready for consumption. One event per published ID.
+
+- For a **simple** (non-repeating) scheduled message, `messageId` is the message's own ID (as returned by the original produce call).
+- For a **repeating** message, `messageId` is the **clone's** ID — the parent stays in the scheduled set for its next tick, so `scheduler.messagePublished` fires once per clone, not for the parent.
+
+| Argument      | Type   | Description                                                              |
+|---------------|--------|--------------------------------------------------------------------------|
+| `messageId`   | string | Message ID (simple) or clone ID (repeating)                              |
+| `queue`       | object | `{ queueParams: { ns, name }, groupId }` (destination)                   |
+
+#### `scheduler.messageDeadLettered`
+
+Fires when a due scheduled message could not be delivered because its target consumer group no longer exists.
+
+On a Pub/Sub queue, a message is bound to a specific consumer group at produce time. If that group is deleted between produce and the message's due time, there is nowhere for the message to go — the scheduler dead‑letters it instead of orphaning it.
+
+- For a **simple** scheduled message, the message itself is dead‑lettered and `messageId` is the message's own ID.
+- For a **repeating** scheduled message, the parent is dead‑lettered to terminate its cycle; the would‑be clone for the current firing is discarded. `messageId` is the parent's ID.
+
+| Argument      | Type   | Description                                                              |
+|---------------|--------|--------------------------------------------------------------------------|
+| `messageId`   | string | Message ID (simple) or parent ID (repeating)                             |
+| `queue`       | object | `{ queueParams: { ns, name }, groupId }` — `groupId` is the deleted group |
 
 ### Consumer Events (USER only)
 
@@ -266,7 +360,7 @@ Fires when system configuration is saved or updated.
 | `queue`       | object | `{ queueParams: { ns, name }, groupId }` |
 | `consumerId`  | string | Consumer ID                     |
 
-> The `queue` argument on consumer and producer events uses the `QueueParsedParams` shape: a nested `queueParams` object (with `ns` and `name`) and a `groupId` field that is `null`/empty for point-to-point queues.
+> The `queue` argument on producer, scheduler, and consumer events uses the `QueueParsedParams` shape: a nested `queueParams` object (with `ns` and `name`) and a `groupId` field that is `null`/empty for point-to-point queues.
 
 ## Cause Enums
 
@@ -326,8 +420,9 @@ The exact API varies by language, but the event names, channel prefixes, and pay
 
 ## Best Practices
 
-- Keep event handlers fast; they run synchronously in the subscriber’s event loop.
+- Keep event handlers fast; they run synchronously in the subscriber's event loop.
 - Do not rely on events for guaranteed data delivery; use message audit for persistent records.
 - Unsubscribe when subscriptions are no longer needed.
-- Treat the public bus as optional. If you don’t need external monitoring, you can avoid starting it entirely.
+- Treat the public bus as optional. If you don't need external monitoring, you can avoid starting it entirely.
 - Never subscribe to the internal system bus from external code; use the public bus for observability.
+- When tracking a scheduled message end-to-end, subscribe to **both** `producer.messageScheduled` (produce-time) and `scheduler.messagePublished` / `scheduler.messageDeadLettered` (fire-time). Neither flow alone gives the full lifecycle.
